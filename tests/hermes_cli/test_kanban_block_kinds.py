@@ -189,6 +189,80 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 
 
 # ---------------------------------------------------------------------------
+# Parking a card that waits on a human (loop breaker -> triage)
+# ---------------------------------------------------------------------------
+
+
+def _breaker_park(conn):
+    """Drive a card until the unblock-loop breaker parks it in ``triage``."""
+    tid = _running_task(conn)
+    for _ in range(kb.BLOCK_RECURRENCE_LIMIT):
+        assert kb.block_task(conn, tid, reason="needs a human", kind="needs_input")
+        if kb.get_task(conn, tid).status == "triage":
+            break
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+    assert kb.get_task(conn, tid).status == "triage"
+    return tid
+
+
+def test_breaker_park_is_not_swept_as_triage_work(kanban_home: Path) -> None:
+    """The breaker's park must read as a park, not as queue work.
+
+    The auto-decompose sweep re-specifies every id this returns, so returning a
+    parked card is what produced the cycle: specified -> promoted -> claimed ->
+    worker blocks again -> breaker fires again, one wasted worker spawn every
+    ~2 minutes while the card was waiting on a person.
+    """
+    with kbc.connect_closing() as conn:
+        tid = _breaker_park(conn)
+        assert kb.list_triage_ids(conn) == []
+        assert kb.list_triage_ids(conn, exclude_parked=False) == [tid]
+        assert kb.is_parked_triage(conn, tid)
+        park = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"][-1]
+        assert (park.payload or {}).get("parked") is True
+
+
+def test_ordinary_triage_card_is_still_swept(kanban_home: Path) -> None:
+    """Skipping parked cards must not turn the triage sweep off."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs a plan", assignee="worker", triage=True)
+        assert kb.list_triage_ids(conn) == [tid]
+        assert not kb.is_parked_triage(conn, tid)
+
+
+def test_specifying_a_parked_card_releases_it(kanban_home: Path) -> None:
+    """Newest event wins: an explicit specify is a later event than the park."""
+    with kbc.connect_closing() as conn:
+        tid = _breaker_park(conn)
+        assert kb.list_triage_ids(conn) == []
+        assert kb.specify_triage_task(conn, tid, title="t", body="b", author="human")
+        assert not kb.is_parked_triage(conn, tid)
+        # Contract: the specify moved it out of triage (a childless card lands
+        # ``ready``; ``todo`` is the parent-gated case).
+        assert kb.get_task(conn, tid).status != "triage"
+
+
+def test_operator_block_from_triage_parks_it_hard(kanban_home: Path) -> None:
+    """``block`` is the operator's escape hatch out of a breaker park."""
+    with kbc.connect_closing() as conn:
+        tid = _breaker_park(conn)
+        assert kb.block_task(conn, tid, reason="hold for David", kind="needs_input")
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.block_kind, task.block_recurrences) == ("blocked", "needs_input", 1)
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_schedule_from_triage_parks_it(kanban_home: Path) -> None:
+    """``schedule`` must accept a triage card — the other escape hatch."""
+    with kbc.connect_closing() as conn:
+        tid = _breaker_park(conn)
+        assert kb.schedule_task(conn, tid, reason="waiting on David")
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+
+# ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
 

@@ -337,7 +337,11 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Parked cards (the loop breaker's destination, waiting on a human) are
+    excluded — the auto-decompose tick calls this, and re-specifying a parked
+    card is what made the card cycle instead of staying parked.
+    """
     with kbc.connect_closing() as conn:
-        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return kb.list_triage_ids(conn, tenant=tenant)

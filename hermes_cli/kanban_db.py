@@ -2101,6 +2101,60 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(trip) and bool(_json_dict(trip["payload"]).get("sticky"))
 
 
+# --- Triage parks (loop breaker) --------------------------------------------
+
+
+def parked_triage_ids(conn: sqlite3.Connection, task_ids: list[str]) -> set[str]:
+    """Subset of ``task_ids`` whose NEWEST event is the loop breaker's park.
+
+    Newest-event-wins on purpose: any later lifecycle event (an explicit
+    ``specify``/``decompose``, an ``unblock``, a ``scheduled`` park) releases the
+    card by construction, so there is no stored flag to go stale. One query for
+    the whole batch.
+    """
+    ids = [tid for tid in task_ids]
+    if not ids:
+        return set()
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT e.task_id AS task_id, e.kind AS kind FROM task_events e "
+        "JOIN (SELECT task_id, MAX(id) AS newest FROM task_events "
+        f"       WHERE task_id IN ({placeholders}) GROUP BY task_id) m "
+        "  ON e.id = m.newest",
+        ids,
+    ).fetchall()
+    return {row["task_id"] for row in rows if row["kind"] == "block_loop_detected"}
+
+
+def is_parked_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when ``task_id``'s newest event is the loop breaker's park."""
+    return task_id in parked_triage_ids(conn, [task_id])
+
+
+def list_triage_ids(
+    conn: sqlite3.Connection, *, tenant: Optional[str] = None, exclude_parked: bool = True,
+) -> list[str]:
+    """Ids of cards in the ``triage`` column.
+
+    ``exclude_parked`` (the default) drops the cards the loop breaker parked
+    there. That destination waits on a HUMAN, not on work: the auto-decompose
+    sweep re-specifies every triage card it can see, so without this the
+    breaker's own park is undone on the next tick — ``specified`` → ``promoted``
+    → claimed → the worker blocks again → the breaker fires again, one wasted
+    run every ~2 minutes while the card waits for a person.
+
+    Pass ``exclude_parked=False`` for a full inventory. An explicit task id is
+    never filtered — ``specify <id>`` / ``decompose <id>`` take the single-task
+    path and do not consult this list.
+    """
+    rows = list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+    ids = [row.id for row in rows]
+    if not exclude_parked:
+        return ids
+    parked = parked_triage_ids(conn, ids)
+    return [tid for tid in ids if tid not in parked]
+
+
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
@@ -3261,7 +3315,13 @@ def block_task(
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
             return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        if cur_row["status"] == "triage":
+            # An operator freezing a card the breaker parked in ``triage``. Keep
+            # the real source so _route_block lands it in the sticky ``blocked``
+            # bucket instead of bouncing it straight back to ``triage``.
+            source_status = "triage"
+        else:
+            source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3286,7 +3346,7 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'triage')
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
@@ -3322,8 +3382,19 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human, and the
+    payload is stamped ``parked`` so that destination is readable as a park
+    rather than as ordinary queue membership (``list_triage_ids`` skips those —
+    see :func:`parked_triage_ids`).
+
+    A ``triage`` source means an OPERATOR is blocking a card the breaker already
+    parked: that is an explicit "hold this", so it lands in the sticky
+    ``blocked`` bucket with the loop counter restarted instead of bouncing
+    straight back to ``triage``.
     """
+    if source_status == "triage":
+        payload = {"reason": reason, "kind": kind, "recurrences": 1, "source_status": source_status}
+        return "blocked", "blocked", "block_kind    = ?,\n                       block_recurrences = ?", (kind, 1), payload
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
@@ -3332,6 +3403,7 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        payload["parked"] = True
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
@@ -3962,7 +4034,13 @@ def schedule_task(
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it.
+
+    ``triage`` is accepted as a source on purpose: it is the operator's escape
+    hatch out of a card the loop breaker parked there, which nothing else can
+    move (``block`` used to refuse the state too, and editing the card restarts
+    the loop).
+    """
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -3972,7 +4050,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"

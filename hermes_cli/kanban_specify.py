@@ -235,7 +235,12 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Task ids in the triage column; ``tenant`` narrows the sweep.
+
+    Cards the loop breaker parked there are skipped — see
+    :func:`hermes_cli.kanban_db.list_triage_ids`. Honouring the park is the whole
+    point: this list feeds the sweeps that re-specify triage cards, and a card
+    waiting on a human must not be swept back into the worker pool every tick.
+    """
     with kbc.connect_closing() as conn:
-        tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+        return kb.list_triage_ids(conn, tenant=tenant)
